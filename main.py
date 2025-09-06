@@ -862,6 +862,11 @@ def cancel_task(task_id: str):
 # -----------------------------------------------------------------------------
 # Google OAuth (single-user demo)
 # -----------------------------------------------------------------------------
+TOKEN_FILE = Path("backend/token.pkl")
+TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+with open(TOKEN_FILE, "wb") as f:
+    pickle.dump(creds, f)
 
 
 @app.get("/login")
