@@ -36,7 +36,7 @@ from backend.google_create import (
     get_or_create_subfolder,
 )
 from backend.google_download import download_folder_as_pdfs
-from backend.config import SCOPES, GA_FOLDER_ID, TEMPLATE_IDS
+from backend.config import SCOPES
 
 # -----------------------------------------------------------------------------
 # App & Config
@@ -808,15 +808,15 @@ async def generate_legacy(
 
 @app.get("/download-all")
 def download_all(folderId: Optional[str] = None):
-    folder_to_use = folderId or GA_FOLDER_ID
+    folder_to_use = folderId
     workdir = tempfile.mkdtemp(prefix="ga_dl_")
     try:
-        skip = (
-            set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
-        )
-        download_folder_as_pdfs(folder_to_use, workdir, skip_ids=skip)
+        # skip = (
+        #     set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
+        # )
+        download_folder_as_pdfs(folder_to_use, workdir, skip_ids=None)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_path = os.path.join(tempfile.gettempdir(), f"GA_Downloads_{ts}.zip")
+        zip_path = os.path.join(tempfile.gettempdir(), f"Sheets_Downloads_{ts}.zip")
         _zip_dir(workdir, zip_path)
 
         def _cleanup():
