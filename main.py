@@ -57,15 +57,16 @@ origins = [VITE_REACT_APP_URL]
 TOKEN_FILE = Path(os.getenv("GOOGLE_TOKEN_FILE", "backend/token.pkl"))
 TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[VITE_REACT_APP_URL],  # add more origins here if needed
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],  # allow X-Google-Access-Token, etc.
+    allow_origins=origins,  # exact domains only
+    allow_credentials=False,  # safest: no cookies across origins
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Google-Access-Token"],  # keep tight
+    expose_headers=["Content-Disposition"],  # so downloads can read filename
 )
-
-
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
 
@@ -814,7 +815,7 @@ def download_all(folderId: Optional[str] = None):
         # skip = (
         #     set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
         # )
-        download_folder_as_pdfs(folder_to_use, workdir, skip_ids=None)
+        download_folder_as_pdfs(folder_to_use, workdir, skip_ids=None)  # skip_ids=skip
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(tempfile.gettempdir(), f"Sheets_Downloads_{ts}.zip")
         _zip_dir(workdir, zip_path)
