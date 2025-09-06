@@ -7,6 +7,8 @@ from fastapi import (
     BackgroundTasks,
     HTTPException,
 )
+
+from pathlib import Path
 from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
@@ -55,19 +57,34 @@ origins = [VITE_REACT_APP_URL]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gaprojectfeedback.zainab.dev"],
+    allow_origins=[VITE_REACT_APP_URL],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-Requested-With"],
 )
 
-CLIENT_SECRETS_FILE = "backend/credentials.json"
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
 
+# Preferred location in repo (dev) and Render Secret File if you set the path to backend/credentials.json
+DEFAULT_SECRETS = Path("backend/credentials.json")
+# Render also exposes secret files here if you used the basename only
+ALT_SECRETS = Path("/etc/secrets/credentials.json")
+
+if DEFAULT_SECRETS.exists():
+    secrets_path = str(DEFAULT_SECRETS)
+elif ALT_SECRETS.exists():
+    secrets_path = str(ALT_SECRETS)
+else:
+    raise FileNotFoundError(
+        "Google client secrets not found. Add a Secret File at 'backend/credentials.json' "
+        "OR at '/etc/secrets/credentials.json' (Render)."
+    )
+
 flow = Flow.from_client_secrets_file(
-    "backend/credentials.json", scopes=SCOPES, redirect_uri=REDIRECT_URI
+    secrets_path, scopes=SCOPES, redirect_uri=REDIRECT_URI
 )
+
 
 # -----------------------------------------------------------------------------
 # Task registry (in-memory)
