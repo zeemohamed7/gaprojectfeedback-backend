@@ -62,15 +62,12 @@ app.add_middleware(
 )
 
 CLIENT_SECRETS_FILE = "backend/credentials.json"
-REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT", "http://localhost:8000/auth/callback")
+REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
-
-from backend.config import CLIENT_SECRETS_FILE
 
 flow = Flow.from_client_secrets_file(
-    str(CLIENT_SECRETS_FILE), scopes=SCOPES, redirect_uri=REDIRECT_URI
+    "backend/credentials.json", scopes=SCOPES, redirect_uri=REDIRECT_URI
 )
-
 
 # -----------------------------------------------------------------------------
 # Task registry (in-memory)
