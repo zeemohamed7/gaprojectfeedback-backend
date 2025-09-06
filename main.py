@@ -36,7 +36,7 @@ from backend.google_create import (
     get_or_create_subfolder,
 )
 from backend.google_download import download_folder_as_pdfs
-from backend.config import SCOPES
+from backend.config import SCOPES, GA_FOLDER_ID, TEMPLATE_IDS
 
 # -----------------------------------------------------------------------------
 # App & Config
@@ -54,14 +54,17 @@ def health():
 VITE_REACT_APP_URL = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
 origins = [VITE_REACT_APP_URL]
 
+TOKEN_FILE = Path(os.getenv("GOOGLE_TOKEN_FILE", "backend/token.pkl"))
+TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[VITE_REACT_APP_URL],
+    allow_origins=[VITE_REACT_APP_URL],  # add more origins here if needed
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Requested-With"],
+    allow_methods=["*"],
+    allow_headers=["*"],  # allow X-Google-Access-Token, etc.
 )
+
 
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
@@ -862,11 +865,6 @@ def cancel_task(task_id: str):
 # -----------------------------------------------------------------------------
 # Google OAuth (single-user demo)
 # -----------------------------------------------------------------------------
-TOKEN_FILE = Path("backend/token.pkl")
-TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-with open(TOKEN_FILE, "wb") as f:
-    pickle.dump(creds, f)
 
 
 @app.get("/login")
@@ -880,26 +878,33 @@ def login():
 @app.get("/auth/callback")
 def auth_callback(request: Request):
     code = request.query_params.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing ?code")
     flow.fetch_token(code=code)
     creds = flow.credentials
-    with open("backend/token.pkl", "wb") as token:
-        pickle.dump(creds, token)
-    return RedirectResponse(url=f"{VITE_REACT_APP_URL}/upload")
+    with open(TOKEN_FILE, "wb") as f:
+        pickle.dump(creds, f)
+    return RedirectResponse(url=f"{VITE_REACT_APP_URL}/upload")  # or your home
 
 
 @app.get("/google/access-token")
 def google_access_token():
-    with open("backend/token.pkl", "rb") as f:
+    if not TOKEN_FILE.exists():
+        raise HTTPException(status_code=404, detail="Not logged in yet")
+
+    with open(TOKEN_FILE, "rb") as f:
         creds = pickle.load(f)
 
-    if not creds.valid and creds.refresh_token:
+    if not creds.valid and getattr(creds, "refresh_token", None):
         creds.refresh(GoogleRequest())
-        with open("backend/token.pkl", "wb") as token:
-            pickle.dump(creds, token)
+        with open(TOKEN_FILE, "wb") as f:
+            pickle.dump(creds, f)
 
     return {
         "access_token": creds.token,
         "expires_at": (
-            creds.expiry.astimezone(timezone.utc).isoformat() if creds.expiry else None
+            creds.expiry.astimezone(timezone.utc).isoformat()
+            if getattr(creds, "expiry", None)
+            else None
         ),
     }
