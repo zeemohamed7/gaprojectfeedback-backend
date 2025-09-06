@@ -34,7 +34,7 @@ from backend.google_create import (
     get_or_create_subfolder,
 )
 from backend.google_download import download_folder_as_pdfs
-
+from backend.config import SCOPES
 
 # -----------------------------------------------------------------------------
 # App & Config
@@ -52,11 +52,6 @@ def health():
 VITE_REACT_APP_URL = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
 origins = [VITE_REACT_APP_URL]
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,11 +62,13 @@ app.add_middleware(
 )
 
 CLIENT_SECRETS_FILE = "backend/credentials.json"
-REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
+REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT", "http://localhost:8000/auth/callback")
 
-# Google OAuth Web flow (single-user demo)
+
+from backend.config import CLIENT_SECRETS_FILE
+
 flow = Flow.from_client_secrets_file(
-    CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI
+    str(CLIENT_SECRETS_FILE), scopes=SCOPES, redirect_uri=REDIRECT_URI
 )
 
 

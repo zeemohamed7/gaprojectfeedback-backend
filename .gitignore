@@ -1,4 +1,3 @@
 .env
-credentials.json
-token.pkl
-groups.xlsx
+backend/credentials.json
+backend/token.pkl
