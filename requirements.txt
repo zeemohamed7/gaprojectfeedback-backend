@@ -1,15 +1,11 @@
-# web
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-
-# config
 python-dotenv==1.0.1
 
-# google apis
 google-api-python-client==2.141.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 
-# csv parsing
+# CSV & deps
 pandas==2.2.2
 numpy==1.26.4
