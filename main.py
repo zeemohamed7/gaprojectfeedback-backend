@@ -6,6 +6,8 @@ from fastapi import (
     File,
     BackgroundTasks,
     HTTPException,
+    Depends,
+    Header,
 )
 
 from pathlib import Path
@@ -46,6 +48,17 @@ load_dotenv()
 app = FastAPI()
 
 
+def get_access_token(
+    x_google_access_token: str | None = Header(None),
+    authorization: str | None = Header(None),
+) -> str:
+    if x_google_access_token:
+        return x_google_access_token
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(None, 1)[1]
+    raise HTTPException(status_code=401, detail="Missing Google access token")
+
+
 @app.get("/healthz")
 def health():
     return {"ok": True}
@@ -64,7 +77,12 @@ app.add_middleware(
     allow_origins=origins,  # exact domains only
     allow_credentials=False,  # safest: no cookies across origins
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Google-Access-Token"],  # keep tight
+    allow_headers=[
+        "Content-Type",
+        "X-Requested-With",
+        "X-Google-Access-Token",
+        "Authorization",
+    ],
     expose_headers=["Content-Disposition"],  # so downloads can read filename
 )
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
@@ -267,7 +285,7 @@ def _run_generate_individuals_task(
 ):
     try:
         task_status[task_id]["status"] = "running"
-        drive = get_drive_service(SCOPES)
+        drive = get_drive_service(SCOPES, access_token=args.get("access_token"))
 
         indiv_folder = get_or_create_subfolder(drive, args["folderId"], "Individuals")
         indiv_folder_id = indiv_folder["id"]
@@ -332,7 +350,7 @@ def _run_generate_groups_task(
 ):
     try:
         task_status[task_id]["status"] = "running"
-        drive = get_drive_service(SCOPES)
+        drive = get_drive_service(SCOPES, access_token=args.get("access_token"))
 
         total = 0
         for _, members in rows:
@@ -450,7 +468,7 @@ def _run_generate_mixed_task(
 ):
     try:
         task_status[task_id]["status"] = "running"
-        drive = get_drive_service(SCOPES)
+        drive = get_drive_service(SCOPES, access_token=args.get("access_token"))
 
         indiv_folder_id = None
         indiv_folder_link = None
@@ -617,6 +635,7 @@ def _run_generate_mixed_task(
 
 @app.post("/generate-individuals")
 async def generate_individuals(
+    access_token: str = Depends(get_access_token),
     folderId: str = Form(...),
     indivTemplateId: str = Form(...),
     roster: UploadFile = File(...),  # CSV with 'Student Name'
@@ -653,7 +672,11 @@ async def generate_individuals(
         _run_generate_individuals_task,
         task_id,
         names,
-        {"folderId": folderId, "indivTemplateId": indivTemplateId},
+        {
+            "folderId": folderId,
+            "indivTemplateId": indivTemplateId,
+            "access_token": access_token,
+        },
         cancel_evt,
     )
     return {"task_id": task_id}
@@ -661,6 +684,7 @@ async def generate_individuals(
 
 @app.post("/generate-groups")
 async def generate_groups(
+    access_token: str = Depends(get_access_token),
     folderId: str = Form(...),
     groupTemplateId: str = Form(...),
     indivGroupTemplateId: str = Form(...),
@@ -706,6 +730,7 @@ async def generate_groups(
             "folderId": folderId,
             "groupTemplateId": groupTemplateId,
             "indivGroupTemplateId": indivGroupTemplateId,
+            "access_token": access_token,
         },
         cancel_evt,
     )
@@ -714,6 +739,7 @@ async def generate_groups(
 
 @app.post("/generate-mixed")
 async def generate_mixed(
+    access_token: str = Depends(get_access_token),
     folderId: str = Form(...),
     groupTemplateId: Optional[str] = Form(None),
     indivGroupTemplateId: Optional[str] = Form(None),
@@ -776,6 +802,7 @@ async def generate_mixed(
             "groupTemplateId": groupTemplateId,
             "indivGroupTemplateId": indivGroupTemplateId,
             "indivTemplateId": indivTemplateId,
+            "access_token": access_token,
         },
         cancel_evt,
     )
@@ -808,14 +835,18 @@ async def generate_legacy(
 
 
 @app.get("/download-all")
-def download_all(folderId: Optional[str] = None):
+def download_all(
+    access_token: str = Depends(get_access_token), folderId: Optional[str] = None
+):
     folder_to_use = folderId
     workdir = tempfile.mkdtemp(prefix="ga_dl_")
     try:
         # skip = (
         #     set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
         # )
-        download_folder_as_pdfs(folder_to_use, workdir, skip_ids=None)  # skip_ids=skip
+        download_folder_as_pdfs(
+            folder_to_use, workdir, skip_ids=None, access_token=access_token
+        )  # skip_ids=skip
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(tempfile.gettempdir(), f"Sheets_Downloads_{ts}.zip")
         _zip_dir(workdir, zip_path)

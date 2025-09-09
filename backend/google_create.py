@@ -9,7 +9,7 @@ import pandas as pd
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request as GoogleRequest
 
-from backend.config import SCOPES
+from backend.backend.config import SCOPES
 
 FOLDER_MT = "application/vnd.google-apps.folder"
 SHEET_MT = "application/vnd.google-apps.spreadsheet"
@@ -18,28 +18,40 @@ SHEET_MT = "application/vnd.google-apps.spreadsheet"
 # --- Auth / Service -----------------------------------------------------------
 
 
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+import os, pickle
+from google.auth.transport.requests import Request as GoogleRequest
+
+
 def get_drive_service(
     scopes=SCOPES,
+    access_token: str | None = None,
     token_file: str = "backend/token.pkl",
 ):
     """
-    Build a Drive v3 client using the token saved by your /login OAuth flow.
-    If token is missing, raise a helpful error (don’t launch InstalledAppFlow in server).
+    Prefer a per-request browser access_token (sent from frontend) so no /login is needed.
+    Fall back to token.pkl only if you still support the old single-user flow.
     """
-    if not os.path.exists(token_file):
-        raise RuntimeError(
-            "No Google token found. Visit /login to authorize and create backend/token.pkl."
-        )
+    # 1) Use the browser-provided token (stateless, per-user)
+    if access_token:
+        creds = Credentials(token=access_token, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    with open(token_file, "rb") as f:
-        creds = pickle.load(f)
+    # 2) Optional fallback for single-user demo
+    if os.path.exists(token_file):
+        with open(token_file, "rb") as f:
+            creds = pickle.load(f)
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(GoogleRequest())
+            with open(token_file, "wb") as f:
+                pickle.dump(creds, f)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    if not creds.valid and creds.refresh_token:
-        creds.refresh(GoogleRequest())
-        with open(token_file, "wb") as f:
-            pickle.dump(creds, f)
-
-    return build("drive", "v3", credentials=creds)
+    # 3) Nothing available
+    raise RuntimeError(
+        "No Google token found. Send 'X-Google-Access-Token' from the frontend."
+    )
 
 
 # --- Drive helpers ------------------------------------------------------------
