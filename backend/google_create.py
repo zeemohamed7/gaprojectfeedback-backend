@@ -9,7 +9,7 @@ import pandas as pd
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request as GoogleRequest
 
-from backend.backend.config import SCOPES
+from backend.config import SCOPES
 
 FOLDER_MT = "application/vnd.google-apps.folder"
 SHEET_MT = "application/vnd.google-apps.spreadsheet"
