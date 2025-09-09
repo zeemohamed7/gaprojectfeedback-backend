@@ -74,17 +74,12 @@ origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # exact domains only
-    allow_credentials=False,  # safest: no cookies across origins
+    allow_origins=[VITE_REACT_APP_URL],
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "X-Requested-With",
-        "X-Google-Access-Token",
-        "Authorization",
-    ],
-    expose_headers=["Content-Disposition"],  # so downloads can read filename
+    allow_headers=["Content-Type", "X-Google-Access-Token", "X-Requested-With"],
+    expose_headers=["Content-Disposition"],
 )
+
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
 
@@ -845,7 +840,7 @@ def download_all(
         #     set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
         # )
         download_folder_as_pdfs(
-            folder_to_use, workdir, skip_ids=None, access_token=access_token
+            folderId, workdir, skip_ids=None, access_token=access_token
         )  # skip_ids=skip
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(tempfile.gettempdir(), f"Sheets_Downloads_{ts}.zip")

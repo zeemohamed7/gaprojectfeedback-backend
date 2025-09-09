@@ -1,13 +1,14 @@
-import os, io, pickle, zipfile, tempfile, shutil
+import os, io, pickle
 from urllib.parse import urlencode
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.auth.transport.requests import Request as GoogleRequest, AuthorizedSession
+from google.oauth2.credentials import Credentials  # <-- NEW
 
 TOKEN_PATH = "backend/token.pkl"
 
 
-def get_creds():
+def get_creds_from_file():
     with open(TOKEN_PATH, "rb") as f:
         creds = pickle.load(f)
     if not creds.valid and creds.refresh_token:
@@ -17,21 +18,29 @@ def get_creds():
     return creds
 
 
+def get_creds(access_token: str | None):
+    """Prefer a short-lived access token from the client; otherwise fall back to server token."""
+    if access_token:
+        # This constructs a Credentials object from a raw bearer token (no refresh).
+        return Credentials(token=access_token)
+    return get_creds_from_file()
+
+
 def get_drive(creds):
     return build("drive", "v3", credentials=creds)
 
 
 SHEETS_PDF_PARAMS = {
     "format": "pdf",
-    "portrait": "true",  # set "false" for landscape
+    "portrait": "true",
     "size": "A4",
-    "scale": "2",  # 1=100%, 2=fit width, 3=fit height, 4=fit page
-    "gridlines": "true",  # ✅ show gridlines
-    "printnotes": "true",  # ✅ include notes
+    "scale": "2",
+    "gridlines": "true",
+    "printnotes": "true",
     "sheetnames": "false",
     "printtitle": "false",
-    "fzr": "true",  # repeat frozen rows
-    "fzc": "true",  # repeat frozen cols
+    "fzr": "true",
+    "fzc": "true",
 }
 
 
@@ -40,7 +49,7 @@ def sheets_export_url(file_id: str, extra: dict | None = None) -> str:
     if extra:
         params.update(
             {
-                k: str(v).lower() if isinstance(v, bool) else str(v)
+                k: (str(v).lower() if isinstance(v, bool) else str(v))
                 for k, v in extra.items()
                 if v is not None
             }
@@ -62,7 +71,7 @@ def _safe(name: str) -> str:
 
 
 def download_google_sheet_pdf(creds, file_id: str, name: str, dest_dir: str) -> str:
-    authed = AuthorizedSession(creds)
+    authed = AuthorizedSession(creds)  # uses the same creds (header or file)
     url = sheets_export_url(file_id)
     r = authed.get(url, stream=True)
     r.raise_for_status()
@@ -97,9 +106,12 @@ def download_drive_binary(drive, file_id: str, name: str, dest_dir: str) -> str:
 
 
 def download_folder_as_pdfs(
-    folder_id: str, dest_dir: str, skip_ids: set[str] | None = None
+    folder_id: str,
+    dest_dir: str,
+    skip_ids: set[str] | None = None,
+    access_token: str | None = None,  # <-- NEW PARAM
 ):
-    creds = get_creds()
+    creds = get_creds(access_token)  # <-- USE HEADER TOKEN IF PROVIDED
     drive = get_drive(creds)
     os.makedirs(dest_dir, exist_ok=True)
 
