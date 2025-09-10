@@ -72,12 +72,18 @@ TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
 
+FRONTEND_ORIGIN = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
+FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX", r"^https://.*\.vercel\.app$")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[VITE_REACT_APP_URL],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Google-Access-Token", "X-Requested-With"],
-    expose_headers=["Content-Disposition"],
+    allow_origins=[FRONTEND_ORIGIN],  # your prod/dev site
+    allow_origin_regex=FRONTEND_ORIGIN_REGEX,  # optional: vercel previews
+    allow_credentials=False,  # you aren’t using cookies
+    allow_methods=["*"],  # IMPORTANT: lets OPTIONS through
+    allow_headers=["*"],  # IMPORTANT: allows custom headers
+    expose_headers=["Content-Disposition"],  # read filenames from downloads
+    max_age=86400,
 )
 
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
