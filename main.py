@@ -65,6 +65,9 @@ def health():
     return {"ok": True}
 
 
+logger = logging.getLogger("uvicorn.error")
+
+
 @app.middleware("http")
 async def log_requests(request, call_next):
     rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
