@@ -9,9 +9,10 @@ from fastapi import (
     Depends,
     Header,
 )
+import logging, time, uuid
 
 from pathlib import Path
-from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.responses import RedirectResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 
@@ -64,6 +65,48 @@ def health():
     return {"ok": True}
 
 
+@app.middleware("http")
+async def log_requests(request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    start = time.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Log full stack for unknown errors
+        logger.exception(
+            "rid=%s unhandled error on %s %s", rid, request.method, request.url.path
+        )
+        # Re-raise to hit the exception handler below (or return here)
+        raise
+    duration_ms = (time.time() - start) * 1000
+    logger.info(
+        "rid=%s %s %s -> %s in %.1fms",
+        rid,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+@app.exception_handler(Exception)
+async def all_exception_handler(request, exc):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    logger.exception("rid=%s exception: %s", rid, exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "request_id": rid,
+        },
+        headers={"X-Request-ID": rid},
+    )
+
+
 VITE_REACT_APP_URL = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
 origins = [VITE_REACT_APP_URL]
 
@@ -79,10 +122,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],  # your prod/dev site
     allow_origin_regex=FRONTEND_ORIGIN_REGEX,  # optional: vercel previews
-    allow_credentials=False,  # you aren’t using cookies
-    allow_methods=["*"],  # IMPORTANT: lets OPTIONS through
-    allow_headers=["*"],  # IMPORTANT: allows custom headers
-    expose_headers=["Content-Disposition"],  # read filenames from downloads
+    allow_credentials=False,  # using header tokens, not cookies
+    allow_methods=["*"],
+    allow_headers=["*", "X-Google-Access-Token"],
+    expose_headers=["X-Request-ID", "Content-Disposition"],
     max_age=86400,
 )
 
