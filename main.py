@@ -9,8 +9,6 @@ from fastapi import (
     Depends,
     Header,
 )
-import logging, time, uuid
-
 from pathlib import Path
 from fastapi.responses import RedirectResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +22,9 @@ import tempfile
 import zipfile
 import shutil
 import threading
+import logging
+import time
+import uuid
 from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
@@ -37,6 +38,7 @@ from backend.google_create import (
     create_sheets_from_df,  # kept for legacy /generate
     get_drive_service,
     get_or_create_subfolder,
+    copy_as_google_sheet,  # ✅ use this everywhere we copy a template
 )
 from backend.google_download import download_folder_as_pdfs
 from backend.config import SCOPES
@@ -45,10 +47,10 @@ from backend.config import SCOPES
 # App & Config
 # -----------------------------------------------------------------------------
 load_dotenv()
-
 app = FastAPI()
 
 
+# --- Token extraction (header-based, stateless) --------------------------------
 def get_access_token(
     x_google_access_token: str | None = Header(None),
     authorization: str | None = Header(None),
@@ -60,11 +62,13 @@ def get_access_token(
     raise HTTPException(status_code=401, detail="Missing Google access token")
 
 
+# --- Health --------------------------------------------------------------------
 @app.get("/healthz")
 def health():
     return {"ok": True}
 
 
+# --- Logging middleware & global exception handler -----------------------------
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -75,11 +79,9 @@ async def log_requests(request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        # Log full stack for unknown errors
         logger.exception(
             "rid=%s unhandled error on %s %s", rid, request.method, request.url.path
         )
-        # Re-raise to hit the exception handler below (or return here)
         raise
     duration_ms = (time.time() - start) * 1000
     logger.info(
@@ -110,55 +112,47 @@ async def all_exception_handler(request, exc):
     )
 
 
-VITE_REACT_APP_URL = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
-origins = [VITE_REACT_APP_URL]
-
-TOKEN_FILE = Path(os.getenv("GOOGLE_TOKEN_FILE", "backend/token.pkl"))
-TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-origins = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
-
+# --- CORS ----------------------------------------------------------------------
 FRONTEND_ORIGIN = os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
 FRONTEND_ORIGIN_REGEX = os.getenv("FRONTEND_ORIGIN_REGEX", r"^https://.*\.vercel\.app$")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],  # your prod/dev site
-    allow_origin_regex=FRONTEND_ORIGIN_REGEX,  # optional: vercel previews
-    allow_credentials=False,  # using header tokens, not cookies
-    allow_methods=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_origin_regex=FRONTEND_ORIGIN_REGEX,
+    allow_credentials=False,  # we pass token via header, not cookies
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*", "X-Google-Access-Token"],
     expose_headers=["X-Request-ID", "Content-Disposition"],
     max_age=86400,
 )
 
+# --- OAuth client secrets / redirect ------------------------------------------
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
-
-# Preferred location in repo (dev) and Render Secret File if you set the path to backend/credentials.json
 DEFAULT_SECRETS = Path("backend/credentials.json")
-# Render also exposes secret files here if you used the basename only
 ALT_SECRETS = Path("/etc/secrets/credentials.json")
-
 if DEFAULT_SECRETS.exists():
     secrets_path = str(DEFAULT_SECRETS)
 elif ALT_SECRETS.exists():
     secrets_path = str(ALT_SECRETS)
 else:
     raise FileNotFoundError(
-        "Google client secrets not found. Add a Secret File at 'backend/credentials.json' "
-        "OR at '/etc/secrets/credentials.json' (Render)."
+        "Google client secrets not found. Add 'backend/credentials.json' "
+        "or '/etc/secrets/credentials.json' (Render Secret File)."
     )
 
 flow = Flow.from_client_secrets_file(
     secrets_path, scopes=SCOPES, redirect_uri=REDIRECT_URI
 )
 
+# If you still keep a single-user token as fallback:
+TOKEN_FILE = Path(os.getenv("GOOGLE_TOKEN_FILE", "backend/token.pkl"))
+TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 # Task registry (in-memory)
 # -----------------------------------------------------------------------------
-
 task_status: Dict[str, Dict[str, Any]] = {}
 task_cancel: Dict[str, threading.Event] = {}
 
@@ -166,8 +160,6 @@ task_cancel: Dict[str, threading.Event] = {}
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-
-
 def _update_progress(task_id: str, step: int, total: int, meta: dict):
     st = task_status.get(task_id)
     if not st:
@@ -191,7 +183,6 @@ def _zip_dir(src_dir: str, zip_path: str):
 
 
 def _load_csv_df(file_bytes: bytes) -> pd.DataFrame:
-    """Robust CSV loader: try encodings and sniff delimiter/quote."""
     last_err = None
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
@@ -199,7 +190,6 @@ def _load_csv_df(file_bytes: bytes) -> pd.DataFrame:
         except Exception as e:
             last_err = e
             continue
-
         sample = "\n".join(text.splitlines()[:50])
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
@@ -208,7 +198,6 @@ def _load_csv_df(file_bytes: bytes) -> pd.DataFrame:
         except Exception:
             delim = ","
             quotechar = '"'
-
         try:
             return pd.read_csv(
                 io.StringIO(text),
@@ -225,9 +214,6 @@ def _load_csv_df(file_bytes: bytes) -> pd.DataFrame:
     raise ValueError(
         f"Could not parse CSV (encodings tried: UTF-8, UTF-8-SIG, cp1252, latin-1). Last error: {last_err}"
     )
-
-
-# ---- CSV parsing for the three flows ----
 
 
 def _parse_names_single_column(
@@ -251,12 +237,10 @@ def _parse_names_single_column(
 def _normalize_group_label(val) -> str:
     if pd.isna(val):
         return ""
-    # If it's numeric like 1.0 → 1
-    if isinstance(val, (int,)):
+    if isinstance(val, int):
         return str(val)
     if isinstance(val, float):
         return str(int(val)) if val.is_integer() else str(val).rstrip("0").rstrip(".")
-    # If it's a string like "1.0" → 1
     s = str(val).strip()
     try:
         f = float(s)
@@ -276,17 +260,15 @@ def _parse_groups_members(df: pd.DataFrame) -> List[Tuple[str, List[str]]]:
     rows: List[Tuple[str, List[str]]] = []
     for _, row in df.iterrows():
         g_raw = row.get(group_col)
-        g = _normalize_group_label(g_raw)  # <<< sanitize here
+        g = _normalize_group_label(g_raw)
         raw = "" if pd.isna(row.get(members_col)) else str(row.get(members_col))
         members = [m.strip() for m in raw.split(",") if m.strip()]
-        if not members:
-            continue
-        rows.append((g, members))
+        if members:
+            rows.append((g, members))
     return rows
 
 
-# ---- Drive helpers ----
-
+# ---- Drive helpers in this file (small find/create utilities) ----------------
 FOLDER_MT = "application/vnd.google-apps.folder"
 
 
@@ -325,8 +307,6 @@ def _find_or_create_folder(drive, parent_id: str, name: str):
 # -----------------------------------------------------------------------------
 # Workers
 # -----------------------------------------------------------------------------
-
-
 def _run_generate_individuals_task(
     task_id: str, names: List[str], args: dict, cancel_evt: threading.Event
 ):
@@ -360,15 +340,12 @@ def _run_generate_individuals_task(
                 _update_progress(task_id, i, total, {"member": name, "skipped": True})
                 continue
 
-            copy = (
-                drive.files()
-                .copy(
-                    fileId=args["indivTemplateId"],
-                    body={"name": target_name, "parents": [indiv_folder_id]},
-                    fields="id, name, webViewLink",
-                    supportsAllDrives=True,
-                )
-                .execute()
+            # ✅ copy & force native Google Sheet
+            copy = copy_as_google_sheet(
+                drive,
+                args["indivTemplateId"],
+                name=target_name,
+                parents=[indiv_folder_id],
             )
             results.append(
                 {
@@ -399,12 +376,7 @@ def _run_generate_groups_task(
         task_status[task_id]["status"] = "running"
         drive = get_drive_service(SCOPES, access_token=args.get("access_token"))
 
-        total = 0
-        for _, members in rows:
-            total += 1  # folder
-            total += 1  # group sheet
-            total += len(members)  # per-member sheets
-
+        total = sum(1 + 1 + len(members) for _, members in rows)
         step = 0
         results = []
 
@@ -414,8 +386,9 @@ def _run_generate_groups_task(
                 task_status[task_id]["status"] = "cancelled"
                 return
 
-            group_folder_name = f"Group {group_number}"
-            folder = _find_or_create_folder(drive, args["folderId"], group_folder_name)
+            folder = _find_or_create_folder(
+                drive, args["folderId"], f"Group {group_number}"
+            )
             folder_id = folder["id"]
             results.append(
                 {"type": "folder", "group": group_number, "link": folder["webViewLink"]}
@@ -428,15 +401,11 @@ def _run_generate_groups_task(
             group_sheet_name = f"Group {group_number} - Requirements"
             existing_group_sheet = _find_in_folder(drive, folder_id, group_sheet_name)
             if not existing_group_sheet:
-                grp = (
-                    drive.files()
-                    .copy(
-                        fileId=args["groupTemplateId"],
-                        body={"name": group_sheet_name, "parents": [folder_id]},
-                        fields="id, name, webViewLink",
-                        supportsAllDrives=True,
-                    )
-                    .execute()
+                grp = copy_as_google_sheet(
+                    drive,
+                    args["groupTemplateId"],
+                    name=group_sheet_name,
+                    parents=[folder_id],
                 )
                 results.append(
                     {
@@ -462,15 +431,13 @@ def _run_generate_groups_task(
                 target = f"{member} - Individual Contribution"
                 existing = _find_in_folder(drive, folder_id, target)
                 if not existing:
-                    copy = (
-                        drive.files()
-                        .copy(
-                            fileId=args["indivGroupTemplateId"],
-                            body={"name": target, "parents": [folder_id]},
-                            fields="id, name, webViewLink",
-                            supportsAllDrives=True,
-                        )
-                        .execute()
+                    copy = copy_as_google_sheet(
+                        drive,
+                        args[
+                            "indivGroupTemplateId"
+                        ],  # ✅ correct template for indiv contribution
+                        name=target,
+                        parents=[folder_id],
                     )
                     results.append(
                         {
@@ -520,12 +487,7 @@ def _run_generate_mixed_task(
         indiv_folder_id = None
         indiv_folder_link = None
 
-        total = 0
-        for _, members in rows:
-            if len(members) > 1:
-                total += 1 + 1 + len(members)
-        total += len(solo_names)
-
+        total = sum(1 + 1 + len(m) for _, m in rows if len(m) > 1) + len(solo_names)
         step = 0
         results = []
 
@@ -537,8 +499,9 @@ def _run_generate_mixed_task(
                 task_status[task_id]["status"] = "cancelled"
                 return
 
-            group_folder_name = f"Group {group_number}"
-            folder = _find_or_create_folder(drive, args["folderId"], group_folder_name)
+            folder = _find_or_create_folder(
+                drive, args["folderId"], f"Group {group_number}"
+            )
             folder_id = folder["id"]
             results.append(
                 {"type": "folder", "group": group_number, "link": folder["webViewLink"]}
@@ -551,15 +514,11 @@ def _run_generate_mixed_task(
             group_sheet_name = f"Group {group_number} - Requirements"
             existing_group_sheet = _find_in_folder(drive, folder_id, group_sheet_name)
             if not existing_group_sheet:
-                grp = (
-                    drive.files()
-                    .copy(
-                        fileId=args["groupTemplateId"],
-                        body={"name": group_sheet_name, "parents": [folder_id]},
-                        fields="id, name, webViewLink",
-                        supportsAllDrives=True,
-                    )
-                    .execute()
+                grp = copy_as_google_sheet(
+                    drive,
+                    args["groupTemplateId"],
+                    name=group_sheet_name,
+                    parents=[folder_id],
                 )
                 results.append(
                     {
@@ -585,15 +544,11 @@ def _run_generate_mixed_task(
                 target = f"{member} - Individual Contribution"
                 existing = _find_in_folder(drive, folder_id, target)
                 if not existing:
-                    copy = (
-                        drive.files()
-                        .copy(
-                            fileId=args["indivGroupTemplateId"],
-                            body={"name": target, "parents": [folder_id]},
-                            fields="id, name, webViewLink",
-                            supportsAllDrives=True,
-                        )
-                        .execute()
+                    copy = copy_as_google_sheet(
+                        drive,
+                        args["indivGroupTemplateId"],  # ✅ correct template
+                        name=target,
+                        parents=[folder_id],
                     )
                     results.append(
                         {
@@ -634,19 +589,14 @@ def _run_generate_mixed_task(
                     task_status[task_id]["results"] = results
                     task_status[task_id]["status"] = "cancelled"
                     return
-
                 target = f"{name} - Individual Feedback"
                 existing = _find_in_folder(drive, indiv_folder_id, target)
                 if not existing:
-                    copy = (
-                        drive.files()
-                        .copy(
-                            fileId=args["indivTemplateId"],
-                            body={"name": target, "parents": [indiv_folder_id]},
-                            fields="id, name, webViewLink",
-                            supportsAllDrives=True,
-                        )
-                        .execute()
+                    copy = copy_as_google_sheet(
+                        drive,
+                        args["indivTemplateId"],  # ✅ correct template
+                        name=target,
+                        parents=[indiv_folder_id],
                     )
                     results.append(
                         {
@@ -676,10 +626,8 @@ def _run_generate_mixed_task(
 
 
 # -----------------------------------------------------------------------------
-# Endpoints: three routes (individuals, groups, mixed)
+# Endpoints
 # -----------------------------------------------------------------------------
-
-
 @app.post("/generate-individuals")
 async def generate_individuals(
     access_token: str = Depends(get_access_token),
@@ -755,10 +703,7 @@ async def generate_groups(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
 
-    total_ops = 0
-    for _, members in rows:
-        total_ops += 1 + 1 + len(members)
-
+    total_ops = sum(1 + 1 + len(members) for _, members in rows)
     task_id = str(uuid4())
     cancel_evt = threading.Event()
     task_cancel[task_id] = cancel_evt
@@ -791,9 +736,7 @@ async def generate_mixed(
     groupTemplateId: Optional[str] = Form(None),
     indivGroupTemplateId: Optional[str] = Form(None),
     indivTemplateId: Optional[str] = Form(None),
-    roster: UploadFile = File(
-        ...
-    ),  # CSV with 'Group','Members' (rows w/ 1 member become solos)
+    roster: UploadFile = File(...),  # CSV with Group, Members (1 member => solo)
     background_tasks: BackgroundTasks = None,
 ):
     if background_tasks is None:
@@ -824,10 +767,7 @@ async def generate_mixed(
             status_code=400, detail="indivTemplateId is required for solo rows."
         )
 
-    total_ops = 0
-    for _, members in groups_rows:
-        total_ops += 1 + 1 + len(members)
-    total_ops += len(solo_names)
+    total_ops = sum(1 + 1 + len(m) for _, m in groups_rows) + len(solo_names)
 
     task_id = str(uuid4())
     cancel_evt = threading.Event()
@@ -856,17 +796,19 @@ async def generate_mixed(
     return {"task_id": task_id}
 
 
-# ---- Legacy route (/generate) kept for back-compat: behaves like /generate-mixed -----
+# ---- Legacy route (/generate) behaves like /generate-mixed --------------------
 @app.post("/generate")
 async def generate_legacy(
+    access_token: str = Depends(get_access_token),
     folderId: str = Form(...),
     groupTemplateId: Optional[str] = Form(None),
     indivGroupTemplateId: Optional[str] = Form(None),
     indivTemplateId: Optional[str] = Form(None),
-    groups: UploadFile = File(...),  # CSV with 'Group','Members'
+    groups: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
 ):
     return await generate_mixed(
+        access_token=access_token,
         folderId=folderId,
         groupTemplateId=groupTemplateId,
         indivGroupTemplateId=indivGroupTemplateId,
@@ -879,21 +821,19 @@ async def generate_legacy(
 # -----------------------------------------------------------------------------
 # Download endpoint
 # -----------------------------------------------------------------------------
-
-
 @app.get("/download-all")
 def download_all(
-    access_token: str = Depends(get_access_token), folderId: Optional[str] = None
+    access_token: str = Depends(get_access_token),
+    folderId: Optional[str] = None,
 ):
-    folder_to_use = folderId
+    if not folderId:
+        raise HTTPException(status_code=400, detail="Missing folderId")
     workdir = tempfile.mkdtemp(prefix="ga_dl_")
     try:
-        # skip = (
-        #     set(TEMPLATE_IDS) if isinstance(TEMPLATE_IDS, (list, set, tuple)) else None
-        # )
+        # If you want to skip template IDs, pass skip_ids={...} here later.
         download_folder_as_pdfs(
             folderId, workdir, skip_ids=None, access_token=access_token
-        )  # skip_ids=skip
+        )
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = os.path.join(tempfile.gettempdir(), f"Sheets_Downloads_{ts}.zip")
         _zip_dir(workdir, zip_path)
@@ -919,8 +859,6 @@ def download_all(
 # -----------------------------------------------------------------------------
 # Task control
 # -----------------------------------------------------------------------------
-
-
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str):
     st = task_status.get(task_id)
@@ -942,10 +880,8 @@ def cancel_task(task_id: str):
 
 
 # -----------------------------------------------------------------------------
-# Google OAuth (single-user demo)
+# Google OAuth (single-user fallback – optional)
 # -----------------------------------------------------------------------------
-
-
 @app.get("/login")
 def login():
     auth_url, state = flow.authorization_url(
@@ -963,27 +899,6 @@ def auth_callback(request: Request):
     creds = flow.credentials
     with open(TOKEN_FILE, "wb") as f:
         pickle.dump(creds, f)
-    return RedirectResponse(url=f"{VITE_REACT_APP_URL}/upload")  # or your home
-
-
-@app.get("/google/access-token")
-def google_access_token():
-    if not TOKEN_FILE.exists():
-        raise HTTPException(status_code=404, detail="Not logged in yet")
-
-    with open(TOKEN_FILE, "rb") as f:
-        creds = pickle.load(f)
-
-    if not creds.valid and getattr(creds, "refresh_token", None):
-        creds.refresh(GoogleRequest())
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
-
-    return {
-        "access_token": creds.token,
-        "expires_at": (
-            creds.expiry.astimezone(timezone.utc).isoformat()
-            if getattr(creds, "expiry", None)
-            else None
-        ),
-    }
+    return RedirectResponse(
+        url=os.getenv("VITE_REACT_APP_URL", "http://localhost:5173")
+    )

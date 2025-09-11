@@ -1,185 +1,352 @@
-import os, io
-from urllib.parse import urlencode
-from typing import Optional, Set
+# backend/google_create.py
+import os
+import io
+import pickle
+import threading
+from typing import Callable, Optional, Dict, Any, List, Tuple
 
+import pandas as pd
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import Request as GoogleRequest
 
-# --- Google MIME types ---
-MT_FOLDER = "application/vnd.google-apps.folder"
-MT_SHEET = "application/vnd.google-apps.spreadsheet"
-MT_DOC = "application/vnd.google-apps.document"
-MT_SLIDE = "application/vnd.google-apps.presentation"
-MT_SHORTCUT = "application/vnd.google-apps.shortcut"
+# If you keep SCOPES here, import as you had it before
+from backend.config import SCOPES
 
-# --- Sheets PDF export options (gridlines + notes) ---
-SHEETS_PDF_PARAMS = {
-    "format": "pdf",
-    "portrait": "true",
-    "size": "A4",
-    "scale": "2",  # 1=100%, 2=fit width, 3=fit height, 4=fit page
-    "gridlines": "true",  # ✅ show gridlines
-    "printnotes": "true",  # ✅ include notes
-    "sheetnames": "false",
-    "printtitle": "false",
-    "fzr": "true",  # repeat frozen rows
-    "fzc": "true",  # repeat frozen cols
+# ---- Mime types ----
+FOLDER_MT = "application/vnd.google-apps.folder"
+SHEET_MT = "application/vnd.google-apps.spreadsheet"
+
+# Accept these as “spreadsheet-ish” sources that we’ll auto-convert into native Sheets
+SPREADSHEETISH = {
+    SHEET_MT,  # already a Google Sheet
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+    "application/vnd.ms-excel",  # .xls
+    "text/csv",  # .csv
+    "application/vnd.oasis.opendocument.spreadsheet",  # .ods
 }
 
 
-def sheets_export_url(file_id: str, extra: dict | None = None) -> str:
-    params = SHEETS_PDF_PARAMS.copy()
-    if extra:
-        params.update(
-            {
-                k: str(v).lower() if isinstance(v, bool) else str(v)
-                for k, v in extra.items()
-                if v is not None
-            }
+# ------------------------------------------------------------------------------
+# Auth (single-user token.pkl pattern)
+# ------------------------------------------------------------------------------
+def get_drive_service(
+    scopes=SCOPES,
+    token_file: str = "backend/token.pkl",
+):
+    """
+    Build a Drive v3 client using a saved OAuth token (token.pkl).
+    This is the legacy/single-user pattern used by the generation workers.
+    """
+    if not os.path.exists(token_file):
+        raise RuntimeError(
+            "No Google token found. Visit /login to authorize and create backend/token.pkl."
         )
+
+    with open(token_file, "rb") as f:
+        creds = pickle.load(f)
+
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(GoogleRequest())
+        with open(token_file, "wb") as f:
+            pickle.dump(creds, f)
+
+    return build("drive", "v3", credentials=creds)
+
+
+# ------------------------------------------------------------------------------
+# Drive helpers
+# ------------------------------------------------------------------------------
+def get_or_create_subfolder(drive, parent_folder_id: str, name: str) -> dict:
+    """
+    Return {'id','name','webViewLink'} for a subfolder named `name` under `parent_folder_id`.
+    If it doesn't exist, create it.
+    """
+    q = (
+        f"name = '{name}' and "
+        f"mimeType = '{FOLDER_MT}' and "
+        f"'{parent_folder_id}' in parents and trashed = false"
+    )
+    resp = (
+        drive.files()
+        .list(
+            q=q,
+            spaces="drive",
+            fields="files(id, name, webViewLink)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+            pageSize=1,
+        )
+        .execute()
+    )
+    files = resp.get("files", [])
+    if files:
+        return files[0]
+
+    folder_metadata = {
+        "name": name,
+        "mimeType": FOLDER_MT,
+        "parents": [parent_folder_id],
+    }
+    created = (
+        drive.files()
+        .create(
+            body=folder_metadata,
+            fields="id, name, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return created
+
+
+def _file_meta(drive, file_id: str) -> dict:
     return (
-        f"https://docs.google.com/spreadsheets/d/{file_id}/export?{urlencode(params)}"
+        drive.files()
+        .get(
+            fileId=file_id,
+            fields="id, name, mimeType, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
     )
 
 
-def _safe(name: str) -> str:
-    bad = '<>:"/\\|?*'
-    return "".join("_" if c in bad else c for c in name).strip().rstrip(".")
+def _is_spreadsheetish(mime: str) -> bool:
+    return (mime or "").lower() in SPREADSHEETISH
 
 
-def _assert_pdf_response(resp):
-    ct = resp.headers.get("Content-Type", "")
-    if "pdf" not in ct.lower():
-        text = ""
-        try:
-            # only read a small chunk to avoid big memory
-            text = resp.text[:400]
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Expected PDF but got Content-Type='{ct}'. "
-            f"(Not authorized? Shortcut? Body starts: {text!r})"
+def ensure_spreadsheetish(drive, file_id: str, label: str):
+    """
+    Light validation: allow Excel/CSV/ODS/Sheets; block PDFs/images/etc.
+    """
+    meta = _file_meta(drive, file_id)
+    mt = meta.get("mimeType", "")
+    if not _is_spreadsheetish(mt):
+        raise ValueError(
+            f"❌ {label} ({meta.get('name')}) is not a spreadsheet file.\n"
+            f"MimeType: {mt}\n"
+            f"Please choose a Google Sheet, Excel (.xlsx/.xls), CSV, or ODS."
         )
 
 
-def _download_sheet_pdf(
-    authed: AuthorizedSession, file_id: str, name: str, dest_dir: str
-) -> str:
-    url = sheets_export_url(file_id)
-    r = authed.get(url, stream=True)
-    r.raise_for_status()
-    _assert_pdf_response(r)
-    out = os.path.join(dest_dir, f"{_safe(name)}.pdf")
-    with open(out, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            if chunk:
-                f.write(chunk)
-    return out
-
-
-def _export_pdf_via_drive(drive, file_id: str, name: str, dest_dir: str) -> str:
-    # For Docs/Slides export to PDF via Drive API
-    request = drive.files().export_media(fileId=file_id, mimeType="application/pdf")
-    out = os.path.join(dest_dir, f"{_safe(name)}.pdf")
-    with open(out, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-    return out
-
-
-def _download_binary(drive, file_id: str, name: str, dest_dir: str) -> str:
-    # For non-Google files (e.g., PNG, PDF already, etc.)
-    request = drive.files().get_media(fileId=file_id)
-    out = os.path.join(dest_dir, _safe(name))
-    with open(out, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-    return out
-
-
-def download_folder_as_pdfs(
-    folder_id: str,
-    dest_dir: str,
-    skip_ids: Optional[Set[str]] = None,
+def copy_as_google_sheet(
+    drive,
+    source_file_id: str,
     *,
-    access_token: str,
-) -> None:
+    name: str,
+    parents: List[str],
+) -> dict:
     """
-    Walk a Drive folder and download:
-      - Google Sheets: PDF (gridlines + notes)
-      - Google Docs/Slides: PDF
-      - Other files: original binary
-      - Shortcuts: resolved and handled by target type
-    Uses the provided OAuth access_token (no token.pkl).
+    Force-copy any spreadsheet-ish file into a *native* Google Sheet by setting mimeType on copy.
+    This preserves your downstream PDF export flags (gridlines, notes).
     """
-    os.makedirs(dest_dir, exist_ok=True)
+    return (
+        drive.files()
+        .copy(
+            fileId=source_file_id,
+            body={
+                "name": name,
+                "parents": parents,
+                "mimeType": SHEET_MT,
+            },
+            fields="id, name, mimeType, webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
 
-    creds = Credentials(token=access_token)  # bearer token from frontend
-    drive = build("drive", "v3", credentials=creds)
-    authed = AuthorizedSession(creds)
 
-    def walk(fid: str, out_dir: str):
-        os.makedirs(out_dir, exist_ok=True)
-        page_token = None
-        while True:
-            resp = (
+def _normalize_group_label(val) -> str:
+    """
+    Normalize group labels like 1.0 -> '1', but pass strings through unchanged.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        return str(int(val)) if val.is_integer() else str(val).rstrip("0").rstrip(".")
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return s
+
+
+# ------------------------------------------------------------------------------
+# Main (legacy) generator kept for /generate
+# ------------------------------------------------------------------------------
+def create_sheets_from_df(
+    df: pd.DataFrame,
+    folder_id: str,
+    group_template: Optional[str],
+    indiv_group_template: Optional[str],
+    indiv_template: Optional[str],
+    *,
+    do_group: bool = False,
+    do_indiv_group: bool = False,
+    do_indiv: bool = False,
+    scopes=SCOPES,
+    cancel_event: Optional[threading.Event] = None,
+    progress_cb: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Legacy 'one function does all' flow (still used by /generate).
+    - Auto-converts spreadsheet-ish templates (xlsx/csv/ods/gsheet) to native Google Sheets on copy.
+    - Creates:
+        * Group folder per row if Members > 1
+        * Group Requirements sheet (from group_template) if do_group
+        * Individual Contribution sheet per member (from indiv_group_template) if do_indiv_group
+        * Solo students (Members == 1) copied to 'Individuals' folder (from indiv_template) if do_indiv
+    """
+    drive = get_drive_service(scopes)
+
+    # Light validation for provided templates (only if that mode is enabled)
+    if do_group and group_template:
+        ensure_spreadsheetish(drive, group_template, "Group Template")
+    if do_indiv_group and indiv_group_template:
+        ensure_spreadsheetish(drive, indiv_group_template, "Indiv Group Template")
+    if do_indiv and indiv_template:
+        ensure_spreadsheetish(drive, indiv_template, "Individual Template")
+
+    # Build Individuals subfolder only if needed
+    individuals_folder_id = None
+    individuals_folder_link = None
+    if do_indiv:
+        indiv_folder = get_or_create_subfolder(drive, folder_id, "Individuals")
+        individuals_folder_id = indiv_folder["id"]
+        individuals_folder_link = indiv_folder.get("webViewLink")
+
+    results: List[Dict[str, Any]] = []
+
+    # Count operations to drive progress
+    total = 0
+    for _, row in df.iterrows():
+        members = [
+            m.strip() for m in str(row.get("Members", "")).split(",") if m.strip()
+        ]
+        if len(members) > 1:
+            if do_group:
+                total += 1  # group sheet
+            if do_indiv_group:
+                total += len(members)  # per-member sheets
+            total += 1  # the folder creation itself (always)
+        else:
+            if do_indiv:
+                total += 1  # solo sheet
+
+    step = 0
+
+    # Process rows
+    for _, row in df.iterrows():
+        if cancel_event and cancel_event.is_set():
+            return {"results": results, "cancelled": True}
+
+        group_raw = row.get("Group")
+        group_number = _normalize_group_label(group_raw)
+        members = [
+            m.strip() for m in str(row.get("Members", "")).split(",") if m.strip()
+        ]
+
+        if len(members) > 1:
+            # Create/find "Group X" folder under parent folder
+            folder_name = f"Group {group_number}"
+            folder = (
                 drive.files()
-                .list(
-                    q=f"'{fid}' in parents and trashed=false",
-                    fields=(
-                        "nextPageToken, files("
-                        "id, name, mimeType, shortcutDetails(targetId, targetMimeType)"
-                        ")"
-                    ),
+                .create(
+                    body={
+                        "name": folder_name,
+                        "mimeType": FOLDER_MT,
+                        "parents": [folder_id],
+                    },
+                    fields="id, name, webViewLink",
                     supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
-                    pageSize=1000,
-                    pageToken=page_token,
                 )
                 .execute()
             )
+            folder_id_created = folder["id"]
+            results.append(
+                {"type": "folder", "group": group_number, "link": folder["webViewLink"]}
+            )
+            step += 1
+            if progress_cb:
+                progress_cb(
+                    step,
+                    total,
+                    {"group": group_number, "members": members, "op": "folder"},
+                )
 
-            for f in resp.get("files", []):
-                if skip_ids and f["id"] in skip_ids:
-                    continue
-
-                fid2 = f["id"]
-                fname = f.get("name", "")
-                mt = f.get("mimeType", "")
-
-                if mt == MT_FOLDER:
-                    walk(fid2, os.path.join(out_dir, _safe(fname)))
-                    continue
-
-                # Resolve shortcuts
-                if mt == MT_SHORTCUT:
-                    tgt = f.get("shortcutDetails") or {}
-                    fid2 = tgt.get("targetId") or fid2
-                    mt = tgt.get("targetMimeType") or mt
-                    # (Optional) refresh metadata for target name
-                    meta = (
-                        drive.files()
-                        .get(fileId=fid2, fields="id, name, mimeType")
-                        .execute()
+            # Group requirements sheet
+            if do_group and group_template:
+                grp = copy_as_google_sheet(
+                    drive,
+                    group_template,
+                    name=f"Group {group_number} - Requirements",
+                    parents=[folder_id_created],
+                )
+                results.append(
+                    {
+                        "type": "group_sheet",
+                        "group": group_number,
+                        "link": grp["webViewLink"],
+                    }
+                )
+                step += 1
+                if progress_cb:
+                    progress_cb(
+                        step, total, {"group": group_number, "op": "group_sheet"}
                     )
-                    fname = meta.get("name", fname)
-                    mt = meta.get("mimeType", mt)
 
-                if mt == MT_SHEET:
-                    _download_sheet_pdf(authed, fid2, fname, out_dir)
-                elif mt in (MT_DOC, MT_SLIDE):
-                    _export_pdf_via_drive(drive, fid2, fname, out_dir)
-                else:
-                    _download_binary(drive, fid2, fname, out_dir)
+            # Per-member contribution sheets
+            if do_indiv_group and indiv_group_template:
+                for member in members:
+                    indiv = copy_as_google_sheet(
+                        drive,
+                        indiv_group_template,
+                        name=f"{member} - Individual Contribution",
+                        parents=[folder_id_created],
+                    )
+                    results.append(
+                        {
+                            "type": "indiv_sheet",
+                            "member": member,
+                            "group": group_number,
+                            "link": indiv["webViewLink"],
+                        }
+                    )
+                    step += 1
+                    if progress_cb:
+                        progress_cb(
+                            step,
+                            total,
+                            {"group": group_number, "member": member, "op": "indiv"},
+                        )
 
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+        else:
+            # Solo → Individuals subfolder
+            if not do_indiv or not indiv_template:
+                # If solo row but indiv mode off, just skip
+                continue
+            solo_name = members[0] if members else ""
+            solo = copy_as_google_sheet(
+                drive,
+                indiv_template,
+                name=f"{solo_name} - Individual Feedback",
+                parents=[individuals_folder_id],
+            )
+            results.append(
+                {
+                    "type": "solo_sheet",
+                    "member": solo_name,
+                    "folder": individuals_folder_link,
+                    "link": solo["webViewLink"],
+                }
+            )
+            step += 1
+            if progress_cb:
+                progress_cb(step, total, {"member": solo_name, "op": "solo"})
 
-    walk(folder_id, dest_dir)
+    return {"results": results, "cancelled": False}

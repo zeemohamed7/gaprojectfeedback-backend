@@ -1,27 +1,31 @@
-# backend/google_create.py
 import os
-import io
 import pickle
 import threading
-from typing import Callable, Optional, Dict, Any, List
+from typing import Callable, Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
 
 from backend.config import SCOPES
 
+# ---- Mime types ----
 FOLDER_MT = "application/vnd.google-apps.folder"
 SHEET_MT = "application/vnd.google-apps.spreadsheet"
 
+# Spreadsheet-ish sources we will accept and auto-convert to native Google Sheets
+SPREADSHEETISH = {
+    SHEET_MT,  # Google Sheet
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+    "application/vnd.ms-excel",  # .xls
+    "text/csv",  # .csv
+    "application/vnd.oasis.opendocument.spreadsheet",  # .ods
+}
 
-# --- Auth / Service -----------------------------------------------------------
-
-
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-import os, pickle
-from google.auth.transport.requests import Request as GoogleRequest
+# ------------------------------------------------------------------------------
+# Auth / Service
+# ------------------------------------------------------------------------------
 
 
 def get_drive_service(
@@ -30,15 +34,13 @@ def get_drive_service(
     token_file: str = "backend/token.pkl",
 ):
     """
-    Prefer a per-request browser access_token (sent from frontend) so no /login is needed.
+    Prefer a per-request browser access_token (sent from frontend).
     Fall back to token.pkl only if you still support the old single-user flow.
     """
-    # 1) Use the browser-provided token (stateless, per-user)
     if access_token:
         creds = Credentials(token=access_token, scopes=scopes)
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # 2) Optional fallback for single-user demo
     if os.path.exists(token_file):
         with open(token_file, "rb") as f:
             creds = pickle.load(f)
@@ -48,21 +50,19 @@ def get_drive_service(
                 pickle.dump(creds, f)
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # 3) Nothing available
     raise RuntimeError(
         "No Google token found. Send 'X-Google-Access-Token' from the frontend."
     )
 
 
-# --- Drive helpers ------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Drive helpers
+# ------------------------------------------------------------------------------
 
 
-def check_template_is_sheet(drive_service, file_id: Optional[str], label: str):
-    """Optional: verify a file is a native Google Sheet. No-op if file_id is falsy."""
-    if not file_id:
-        return
-    meta = (
-        drive_service.files()
+def _file_meta(drive, file_id: str) -> dict:
+    return (
+        drive.files()
         .get(
             fileId=file_id,
             fields="id,name,mimeType,webViewLink",
@@ -70,25 +70,55 @@ def check_template_is_sheet(drive_service, file_id: Optional[str], label: str):
         )
         .execute()
     )
-    if meta["mimeType"] != SHEET_MT:
+
+
+def _is_spreadsheetish(mime: str) -> bool:
+    return (mime or "").lower() in SPREADSHEETISH
+
+
+def ensure_spreadsheetish(drive, file_id: Optional[str], label: str) -> None:
+    """
+    Validate a template is spreadsheet-ish (gsheet/xlsx/xls/csv/ods).
+    Raises a friendly error otherwise.
+    """
+    if not file_id:
+        return
+    meta = _file_meta(drive, file_id)
+    mt = meta.get("mimeType", "")
+    if not _is_spreadsheetish(mt):
         raise ValueError(
-            f"❌ {label} ({meta['name']}) is not a Google Sheet. "
-            f"Open in Drive and File → Save as Google Sheets."
+            f"❌ {label} ({meta.get('name')}) is not a spreadsheet.\n"
+            f"MimeType: {mt}\n"
+            f"Please provide a Google Sheet, Excel (.xlsx/.xls), CSV, or ODS."
         )
 
 
-def get_or_create_subfolder(drive_service, parent_folder_id: str, name: str) -> dict:
+def copy_as_google_sheet(
+    drive, source_file_id: str, *, name: str, parents: List[str]
+) -> dict:
     """
-    Return {'id','name','webViewLink'} for subfolder named `name` under `parent_folder_id`.
-    If missing, create it.
+    Force-copy any spreadsheet-ish file as a *native Google Sheet* by specifying mimeType.
     """
+    return (
+        drive.files()
+        .copy(
+            fileId=source_file_id,
+            body={"name": name, "parents": parents, "mimeType": SHEET_MT},
+            fields="id,name,mimeType,webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+
+
+def get_or_create_subfolder(drive, parent_folder_id: str, name: str) -> dict:
     q = (
         f"name = '{name}' and "
         f"mimeType = '{FOLDER_MT}' and "
         f"'{parent_folder_id}' in parents and trashed = false"
     )
     resp = (
-        drive_service.files()
+        drive.files()
         .list(
             q=q,
             spaces="drive",
@@ -102,9 +132,8 @@ def get_or_create_subfolder(drive_service, parent_folder_id: str, name: str) -> 
     files = resp.get("files", [])
     if files:
         return files[0]
-
-    created = (
-        drive_service.files()
+    return (
+        drive.files()
         .create(
             body={"name": name, "mimeType": FOLDER_MT, "parents": [parent_folder_id]},
             fields="id,name,webViewLink",
@@ -112,12 +141,31 @@ def get_or_create_subfolder(drive_service, parent_folder_id: str, name: str) -> 
         )
         .execute()
     )
-    return created
 
 
-# --- Back-compat generator (mode-aware) --------------------------------------
-# You don’t *need* this for the new endpoints, but main.py imports it.
-# Keeping a functional version avoids ImportErrors and lets you call /generate (legacy) if desired.
+def _normalize_group_label(val) -> str:
+    """
+    Normalize group labels like 1.0 -> '1', but leave normal strings alone.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        return str(int(val)) if val.is_integer() else str(val).rstrip("0").rstrip(".")
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return s
+
+
+# ------------------------------------------------------------------------------
+# Individuals helpers for legacy flow
+# ------------------------------------------------------------------------------
 
 
 def _collect_individual_names_from_df(df: pd.DataFrame) -> List[str]:
@@ -165,6 +213,11 @@ def _collect_individual_names_from_df(df: pd.DataFrame) -> List[str]:
     )
 
 
+# ------------------------------------------------------------------------------
+# Legacy, mode-aware generator used by /generate (kept for compatibility)
+# ------------------------------------------------------------------------------
+
+
 def create_sheets_from_df(
     df: pd.DataFrame,
     folder_id: str,
@@ -180,33 +233,25 @@ def create_sheets_from_df(
     progress_cb: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Legacy, mode-aware generator:
-      - do_group: copy group_template once per group into 'Group X' folder.
-      - do_indiv_group: copy indiv_group_template per member inside 'Group X'.
-      - do_indiv: copy indiv_template into shared 'Individuals/' for solo students,
-                  or for rows in an individuals-only CSV.
-
-    Returns: {"results": [...], "cancelled": bool}
+    Legacy generator supporting three modes. NOW auto-converts any spreadsheet-ish template
+    to native Google Sheets on copy, so later PDF export (gridlines + notes) works.
     """
     if not (do_group or do_indiv_group or do_indiv):
         raise ValueError("Pick at least one creation mode.")
 
     drive = get_drive_service(scopes)
 
-    # Validate only templates used
+    # Validate templates you'll actually use
     if do_group:
-        check_template_is_sheet(drive, group_template, "Group Template")
+        ensure_spreadsheetish(drive, group_template, "Group Template")
     if do_indiv_group:
-        check_template_is_sheet(
-            drive, indiv_group_template, "Individual Group Template"
-        )
+        ensure_spreadsheetish(drive, indiv_group_template, "Individual Group Template")
     if do_indiv:
-        check_template_is_sheet(drive, indiv_template, "Individual Template")
+        ensure_spreadsheetish(drive, indiv_template, "Individual Template")
 
     if df is None or df.empty:
         return {"results": [], "cancelled": False}
 
-    # Try to detect group/members layout
     cols = {c.lower(): c for c in df.columns}
     group_col = cols.get("group")
     members_col = cols.get("members")
@@ -224,7 +269,7 @@ def create_sheets_from_df(
         individuals_folder_id = folder["id"]
         individuals_folder_link = folder["webViewLink"]
 
-    # Individuals-only input (no group/members headers)
+    # Individuals-only CSV (no Group/Members headers)
     if not group_col and not members_col:
         if not do_indiv:
             raise ValueError(
@@ -236,18 +281,12 @@ def create_sheets_from_df(
         for i, name in enumerate(names, start=1):
             if cancel_event and cancel_event.is_set():
                 return {"results": results, "cancelled": True}
-            copy = (
-                drive.files()
-                .copy(
-                    fileId=indiv_template,
-                    body={
-                        "name": f"{name} - Individual Feedback",
-                        "parents": [individuals_folder_id],
-                    },
-                    fields="id, name, webViewLink",
-                    supportsAllDrives=True,
-                )
-                .execute()
+            # AUTO-CONVERT to native Google Sheet
+            copy = copy_as_google_sheet(
+                drive,
+                indiv_template,
+                name=f"{name} - Individual Feedback",
+                parents=[individuals_folder_id],
             )
             results.append(
                 {
@@ -266,13 +305,14 @@ def create_sheets_from_df(
         if cancel_event and cancel_event.is_set():
             return {"results": results, "cancelled": True}
 
-        group_number = str(row.get(group_col))
+        group_raw = row.get(group_col)
+        group_number = _normalize_group_label(group_raw)
         raw_members = "" if pd.isna(row.get(members_col)) else str(row.get(members_col))
         members = [m.strip() for m in raw_members.split(",") if m.strip()]
         is_group_row = len(members) > 1
         is_solo_row = len(members) == 1
 
-        # Group rows → create Group folder and contents
+        # Group rows
         if is_group_row and (do_group or do_indiv_group):
             folder = (
                 drive.files()
@@ -282,7 +322,7 @@ def create_sheets_from_df(
                         "mimeType": FOLDER_MT,
                         "parents": [folder_id],
                     },
-                    fields="id, name, webViewLink",
+                    fields="id,name,webViewLink",
                     supportsAllDrives=True,
                 )
                 .execute()
@@ -292,19 +332,13 @@ def create_sheets_from_df(
                 {"type": "folder", "group": group_number, "link": folder["webViewLink"]}
             )
 
+            # Group Requirements (AUTO-CONVERT)
             if do_group:
-                grp = (
-                    drive.files()
-                    .copy(
-                        fileId=group_template,
-                        body={
-                            "name": f"Group {group_number} - Requirements",
-                            "parents": [folder_id_created],
-                        },
-                        fields="id, name, webViewLink",
-                        supportsAllDrives=True,
-                    )
-                    .execute()
+                grp = copy_as_google_sheet(
+                    drive,
+                    group_template,
+                    name=f"Group {group_number} - Requirements",
+                    parents=[folder_id_created],
                 )
                 results.append(
                     {
@@ -314,20 +348,14 @@ def create_sheets_from_df(
                     }
                 )
 
+            # Member contribution (AUTO-CONVERT)
             if do_indiv_group:
                 for member in members:
-                    copy = (
-                        drive.files()
-                        .copy(
-                            fileId=indiv_group_template,
-                            body={
-                                "name": f"{member} - Individual Contribution",
-                                "parents": [folder_id_created],
-                            },
-                            fields="id, name, webViewLink",
-                            supportsAllDrives=True,
-                        )
-                        .execute()
+                    copy = copy_as_google_sheet(
+                        drive,
+                        indiv_group_template,
+                        name=f"{member} - Individual Contribution",
+                        parents=[folder_id_created],
                     )
                     results.append(
                         {
@@ -338,22 +366,15 @@ def create_sheets_from_df(
                         }
                     )
 
-        # Solo rows → Individuals folder (if enabled)
+        # Solo rows
         if is_solo_row and do_indiv:
             ensure_individuals()
             member = members[0]
-            copy = (
-                drive.files()
-                .copy(
-                    fileId=indiv_template,
-                    body={
-                        "name": f"{member} - Individual Feedback",
-                        "parents": [individuals_folder_id],
-                    },
-                    fields="id, name, webViewLink",
-                    supportsAllDrives=True,
-                )
-                .execute()
+            copy = copy_as_google_sheet(
+                drive,
+                indiv_template,
+                name=f"{member} - Individual Feedback",
+                parents=[individuals_folder_id],
             )
             # add folder link once
             if not any(r.get("type") == "individuals_folder" for r in results):
