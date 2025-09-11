@@ -856,7 +856,7 @@ async def generate_mixed(
     return {"task_id": task_id}
 
 
-# ---- Legacy route (/generate) kept for back-compat: behaves like /generate-mixed ----
+# ---- Legacy route (/generate) kept for back-compat: behaves like /generate-mixed -----
 @app.post("/generate")
 async def generate_legacy(
     folderId: str = Form(...),
